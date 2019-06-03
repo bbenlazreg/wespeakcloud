@@ -1,0 +1,140 @@
+ stages:
+   - test
+   - build
+   - deploy_staging
+   - release
+   - deploy_prod
+
+ image: docker:stable
+ 
+ cache:
+  key: docker_master_tag
+  paths:
+  - dockersha.txt
+
+ variables:
+   DOCKER_HOST: tcp://localhost:2375/
+   DOCKER_DRIVER: overlay2
+   IMAGE_TAG: gcr.io/$GCP_PROJECT_ID/wespeakcloud-app:$CI_COMMIT_SHA
+   #CHART_PATH: https://raw.githubusercontent.com/bbenlazreg/wespeakcloud-app-helm-chart/master/wespeakcloud-app-helm-chart-0.1.0.tgz
+   CHART_PATH: ./wespeakcloud-app-helm-chart
+   PROJECT_NAMESPACE: wespeakcloud
+
+
+ services:
+   - docker:dind
+
+ test:
+   stage: test
+   except: [ tags ]
+   image: python:2.7-slim
+   script:
+     - pip install -r requirements.txt
+     - python -m unittest discover
+
+ build:
+   stage: build
+   except: [ tags ]
+   script:
+     - docker info
+     - echo "$GCP_SERVICE_KEY" > "$(pwd)/gitlab-sa.json"
+     - cat "$(pwd)/gitlab-sa.json" | docker login -u _json_key --password-stdin https://gcr.io
+     - docker build -t $IMAGE_TAG .
+     - docker push $IMAGE_TAG
+     - echo $IMAGE_TAG
+
+ deploy_staging:
+   stage: deploy_staging
+   image: devth/helm
+   script:
+     - helm init --service-account tiller --upgrade
+     - helm upgrade
+       --install wespeakcloud-app-$CI_ENVIRONMENT_SLUG
+       --namespace $PROJECT_NAMESPACE
+       --set image.tag=$CI_COMMIT_SHA
+       --set env=$CI_ENVIRONMENT_SLUG
+       --set ingress.hosts[0]=$CI_ENVIRONMENT_SLUG-wespeakcloud.gcp.alamara-labs.com
+       --recreate-pods
+       --force
+       $CHART_PATH
+   except: [ master, tags ]
+   environment:
+     name: test
+     url: http://$CI_ENVIRONMENT_SLUG-wespeakcloud.gcp.alamara-labs.com
+     on_stop: review_stop
+
+ review_stop:
+   stage: deploy_staging
+   image: devth/helm
+   when: manual
+   except: [ master, tags ]
+   script:
+     - helm init --service-account tiller --upgrade
+     - helm delete --purge wespeakcloud-app-$CI_ENVIRONMENT_SLUG
+   environment:
+     name: test
+     action: stop
+
+ push_latest:
+ 
+   stage: release
+   only: [ master ]
+   script:
+     - echo "$GCP_SERVICE_KEY" > "$(pwd)/gitlab-sa.json"
+     - cat "$(pwd)/gitlab-sa.json" | docker login -u _json_key --password-stdin https://gcr.io
+     - echo $CI_COMMIT_SHA > dockersha.txt
+     - cat dockersha.txt
+     - docker pull $IMAGE_TAG
+     - docker tag $IMAGE_TAG gcr.io/$GCP_PROJECT_ID/wespeakcloud-app:latest
+     - docker push gcr.io/$GCP_PROJECT_ID/wespeakcloud-app:latest
+
+ push_tag:
+   stage: release
+   only: [ tags ]
+   script:
+     - cat dockersha.txt
+     - echo "$GCP_SERVICE_KEY" > "$(pwd)/gitlab-sa.json"
+     - cat "$(pwd)/gitlab-sa.json" | docker login -u _json_key --password-stdin https://gcr.io
+     - docker pull gcr.io/$GCP_PROJECT_ID/wespeakcloud-app:$(cat dockersha.txt)
+     - docker tag $IMAGE_TAG gcr.io/$GCP_PROJECT_ID/wespeakcloud-app:$CI_COMMIT_REF_NAME
+     - docker push gcr.io/$GCP_PROJECT_ID/wespeakcloud-app:$CI_COMMIT_REF_NAME
+     
+ deploy_prod:
+   stage: deploy_prod
+   when: manual
+   image: devth/helm
+   script:
+     - helm upgrade
+       --install wespeakcloud-app-$CI_ENVIRONMENT_SLUG
+       --namespace $PROJECT_NAMESPACE
+       --set image.tag=$CI_COMMIT_REF_NAME
+       --set env=$CI_ENVIRONMENT_SLUG
+       --set ingress.hosts[0]=$CI_ENVIRONMENT_SLUG-wespeakcloud.gcp.alamara-labs.com
+       --recreate-pods
+       --force
+       $CHART_PATH
+   only: [ tags ]
+   environment:
+     name: prod
+     url: http://$CI_ENVIRONMENT_SLUG-wespeakcloud.gcp.alamara-labs.com
+
+ fallback_previous:
+   stage: deploy_prod
+   image: devth/helm
+   when: manual
+   only: [ tags ]
+   script:
+     - git tag | tail -2 | head -1 > previous_tag.txt
+     - cat previous_tag.txt
+     - helm upgrade
+       --install wespeakcloud-app-$CI_ENVIRONMENT_SLUG
+       --namespace $PROJECT_NAMESPACE
+       --set image.tag=$(cat previous_tag.txt)
+       --set env=$CI_ENVIRONMENT_SLUG
+       --set ingress.hosts[0]=$CI_ENVIRONMENT_SLUG-wespeakcloud.gcp.alamara-labs.com
+       --recreate-pods
+       --force
+       $CHART_PATH
+   environment:
+     name: prod
+     url: http://$CI_ENVIRONMENT_SLUG-wespeakcloud.gcp.alamara-labs.com
